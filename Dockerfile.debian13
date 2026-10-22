@@ -1,0 +1,76 @@
+# rtpengine 2.0.0 —— debian:13 多阶段构建
+# 合规要求:必须用 debian 基础镜像;用阿里云源加速
+#
+# 用法: docker build -t rtpengine:2.0.0-debian13 -f Dockerfile.debian13 .
+# 注:编译源码来自本仓库(rtpengine 2.0.0 tag),需先 git clone
+
+# ============ Stage 1: 编译 ============
+FROM debian:13 AS builder
+
+# 换阿里云源(debian trixie)
+RUN rm -f /etc/apt/sources.list.d/debian.sources && \
+    printf 'Types: deb\nURIs: http://mirrors.aliyun.com/debian\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\n' > /etc/apt/sources.list.d/debian.sources && \
+    printf 'Types: deb\nURIs: http://mirrors.aliyun.com/debian-security\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n' >> /etc/apt/sources.list.d/debian.sources
+
+# 安装编译依赖 + 工具
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential pkg-config gperf pandoc \
+    libglib2.0-dev libjson-glib-dev libcurl4-openssl-dev libssl-dev \
+    libevent-dev libpcre2-dev libspandsp-dev libopus-dev \
+    libwebsockets-dev libhiredis-dev libjwt-dev \
+    libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+    libswresample-dev libavfilter-dev \
+    libmariadb-dev libbcg729-dev libsystemd-dev libzstd-dev libncursesw5-dev libpcap-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 拷贝源码(排除 .git 和已编译产物,避免 COPY 巨大)
+WORKDIR /src
+COPY daemon daemon
+COPY recording-daemon recording-daemon
+COPY perf-tester perf-tester
+COPY lib lib
+COPY utils utils
+COPY include include
+COPY kernel-module kernel-module
+COPY docs docs
+COPY fixtures fixtures
+COPY evs evs
+COPY Makefile .
+COPY debian debian
+
+# 兼容 MariaDB 头文件路径(rtpengine 用 <mysql/errmsg.h>,debian 的 mariadb 在 mariadb/)
+RUN ln -sfn /usr/include/mariadb /usr/include/mysql
+
+# 编译
+RUN make -j$(nproc)
+
+# ============ Stage 2: 精简运行镜像 ============
+FROM debian:13-slim AS runtime
+
+# 阿里云源
+RUN rm -f /etc/apt/sources.list.d/debian.sources && \
+    printf 'Types: deb\nURIs: http://mirrors.aliyun.com/debian\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\n' > /etc/apt/sources.list.d/debian.sources && \
+    printf 'Types: deb\nURIs: http://mirrors.aliyun.com/debian-security\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n' >> /etc/apt/sources.list.d/debian.sources
+
+# 只装运行库(不带 -dev)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 libjson-glib-1.0-0 libcurl4 libssl3t64 \
+    libevent-2.1-7 libpcre2-8-0 libspandsp2 libopus0 \
+    libwebsockets19 libhiredis1.1.0 libjwt2 \
+    libavcodec61 libavformat61 libavutil59 libswscale8 \
+    libswresample5 libavfilter10 \
+    libmariadb3 libbcg729-0 libsystemd0 libzstd1 \
+    libevent-pthreads-2.1-7 libpcap0.8 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 拷贝编译好的二进制
+COPY --from=builder /src/daemon/rtpengine /usr/local/bin/rtpengine
+
+# 运行库可能没被自动拉到,补 ldd 检查
+RUN ldd /usr/local/bin/rtpengine 2>&1 | grep -q "not found" \
+    && echo "⚠️ 有缺失库:" && ldd /usr/local/bin/rtpengine | grep "not found" \
+    || echo "✅ 依赖完整"
+
+EXPOSE 22222 30000-31000
+CMD ["rtpengine", "--help"]
